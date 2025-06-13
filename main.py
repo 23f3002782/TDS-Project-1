@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import logging
@@ -152,6 +153,15 @@ class AnswerResponse(BaseModel):
 # (They only query the existing Pinecone index, no heavy processing)
 
 app = FastAPI(title="TDS Virtual TA", description="Virtual Teaching Assistant")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 def semantic_search(query: str, top_k: int = 5, source_filter: str = None) -> List[Dict[str, Any]]:
     """Search for relevant content using embeddings"""
@@ -321,7 +331,7 @@ if __name__ == "__main__":
     # No data initialization needed!
     uvicorn.run(
         app, 
-        host="0.0.0.0", 
+        host="localhost", 
         port=int(os.getenv("PORT", 8000)),
         workers=1
     )
