@@ -2,90 +2,52 @@ import os
 import base64
 from io import BytesIO
 from PIL import Image
-import json
 from typing import List, Dict, Any, Optional
-from tqdm import tqdm
-import glob
 from dotenv import load_dotenv
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 import logging
-from sentence_transformers import SentenceTransformer
 from huggingface_hub import InferenceClient
-import re
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Initialize clients
-pinecone = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-
-# Initialize Pinecone index
-index_name = "tds-embeddings-hf-v2"
-if index_name not in pinecone.list_indexes().names():
-    pinecone.create_index(
-        name=index_name,
-        dimension=768,  # nomic-embed-text-v1.5 dimension
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud="aws",
-            region="us-east-1"
-        )
-    )
-
-index = pinecone.Index(index_name)
-
-class HuggingFaceLLM:
+class HuggingFaceQueryLLM:
+    """Lightweight LLM class for query processing only"""
+    
     def __init__(self, model: str = "mistralai/Magistral-Small-2506", embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"):
         self.model = model
         self.embedding_model = embedding_model
-        # self.hf_token = os.getenv("HF_TOKEN")
         self.hf_token = os.getenv("HF_TOKEN")
         
         if not self.hf_token:
             raise ValueError("HF_TOKEN environment variable is required")
         
-        # Initialize Hugging Face client
+        # Initialize Hugging Face client for chat completions
         self.client = InferenceClient(
             provider="featherless-ai",
             api_key=self.hf_token,
         )
         
-        # Initialize embedding model
-        try:
-            self.embedding_model_instance = SentenceTransformer(
-                self.embedding_model, 
-                trust_remote_code=True
-            )
-            logger.info(f"Embedding model {self.embedding_model} loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
-            raise Exception(f"Failed to load embedding model: {str(e)}")
+        # Initialize embedding client
+        self.embedding_client = InferenceClient(
+            model=self.embedding_model,
+            token=self.hf_token
+        )
         
-        self._verify_models()
-    
-    def _verify_models(self):
-        """Verify that the models are accessible"""
-        try:
-            # Test embedding model
-            test_embedding = self.get_embedding("test")
-            logger.info(f"Embedding model test successful, dimension: {len(test_embedding)}")
-            
-            # Test generation model
-            test_response = self.generate_completion([
-                {"role": "user", "content": "Hello, respond with just 'OK' if you're working."}
-            ], max_tokens=10)
-            logger.info(f"Generation model test successful: {test_response}")
-            
-        except Exception as e:
-            logger.error(f"Error verifying models: {e}")
-            raise Exception(f"Failed to verify Hugging Face models: {str(e)}")
+        # Direct API endpoint for embeddings (fallback)
+        self.embedding_api_url = f"https://api-inference.huggingface.co/models/{self.embedding_model}"
+        self.headers = {"Authorization": f"Bearer {self.hf_token}"}
+        
+        logger.info(f"Initialized HuggingFace LLM with model: {self.model}")
+        logger.info(f"Embedding model: {self.embedding_model}")
 
     def generate_completion(self, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 1200) -> str:
         """Generate completion using Hugging Face Inference API"""
@@ -103,7 +65,7 @@ class HuggingFaceLLM:
             raise Exception(f"Hugging Face generation failed: {str(e)}")
     
     def generate_completion_with_image(self, messages: List[Dict[str, Any]], temperature: float = 0.7, max_tokens: int = 1200) -> str:
-        """Handle image + text - extract text and note image limitation for non-vision models"""
+        """Handle image + text queries"""
         text_messages = []
         has_image = False
         
@@ -115,7 +77,6 @@ class HuggingFaceLLM:
                         text_parts.append(content["text"])
                     elif content.get("type") == "image_url":
                         has_image = True
-                        # For non-vision models, we can't process the image
                         text_parts.append("[IMAGE PROVIDED - Current model cannot analyze images. Please describe the image or use a vision-capable model.]")
                 
                 text_messages.append({
@@ -125,7 +86,6 @@ class HuggingFaceLLM:
             else:
                 text_messages.append(msg)
         
-        # Add note about image limitation if image was provided
         if has_image:
             text_messages.insert(-1, {
                 "role": "system",
@@ -135,10 +95,44 @@ class HuggingFaceLLM:
         return self.generate_completion(text_messages, temperature, max_tokens)
     
     def get_embedding(self, text: str) -> List[float]:
-        """Get embedding using SentenceTransformers"""
+        """Get embedding for user query using Hugging Face API"""
         try:
-            embedding = self.embedding_model_instance.encode([text])
-            return embedding[0].tolist()
+            # Method 1: Using InferenceClient
+            try:
+                response = self.embedding_client.feature_extraction([text])
+                if isinstance(response, list):
+                    if isinstance(response[0], list):
+                        return response[0]
+                    else:
+                        return response
+                else:
+                    raise ValueError(f"Unexpected response format: {type(response)}")
+                    
+            except Exception as client_error:
+                logger.warning(f"InferenceClient failed, trying direct API: {client_error}")
+                
+                # Method 2: Direct API call as fallback
+                payload = {"inputs": text}
+                response = requests.post(
+                    self.embedding_api_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code != 200:
+                    raise Exception(f"API request failed: {response.status_code} - {response.text}")
+                
+                result = response.json()
+                
+                if isinstance(result, list):
+                    if len(result) > 0 and isinstance(result[0], list):
+                        return result[0]
+                    else:
+                        return result
+                else:
+                    raise ValueError(f"Unexpected API response format: {type(result)}")
+                    
         except Exception as e:
             logger.error(f"Failed to get embedding: {e}")
             raise Exception(f"Failed to get embedding: {str(e)}")
@@ -146,25 +140,18 @@ class HuggingFaceLLM:
 def process_image(base64_image: str) -> str:
     """Process and validate base64 image"""
     try:
-        # Handle data URL format
         if base64_image.startswith('data:'):
             base64_image = base64_image.split(',')[1]
         
-        # Decode base64 image
         image_data = base64.b64decode(base64_image)
-        
-        # Validate it's a proper image
         img = Image.open(BytesIO(image_data))
         
-        # Convert to RGB if necessary
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Resize if too large
         max_size = (1024, 1024)
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
         
-        # Convert back to base64
         buffer = BytesIO()
         img.save(buffer, format="JPEG", quality=85)
         processed_base64 = base64.b64encode(buffer.getvalue()).decode()
@@ -175,351 +162,33 @@ def process_image(base64_image: str) -> str:
         logger.error(f"Image processing error: {e}")
         raise ValueError(f"Invalid image format: {str(e)}")
 
-# Initialize the Hugging Face LLM
-hf_llm = HuggingFaceLLM()
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-    """Split text into overlapping chunks"""
-    if not text or len(text.strip()) == 0:
-        return []
-    
-    chunks = []
-    start = 0
-    text = text.strip()
-    
-    while start < len(text):
-        end = start + chunk_size
-        
-        if end >= len(text):
-            # Last chunk
-            chunk = text[start:]
-        else:
-            chunk = text[start:end]
-            
-            # Try to break at sentence boundary
-            last_period = chunk.rfind('.')
-            last_newline = chunk.rfind('\n')
-            last_space = chunk.rfind(' ')
-            
-            # Choose the best break point
-            break_points = [p for p in [last_period, last_newline, last_space] if p > start + chunk_size // 2]
-            
-            if break_points:
-                break_point = max(break_points)
-                chunk = text[start:break_point + (1 if break_point == last_period else 0)]
-                end = break_point + (1 if break_point == last_period else 0)
-        
-        chunk = chunk.strip()
-        if chunk:  # Only add non-empty chunks
-            chunks.append(chunk)
-        
-        start = max(end - overlap, start + 1)  # Ensure progress
-        
-        if start >= len(text):
-            break
-    
-    return chunks
-
-def process_markdown_files(folder_path: str) -> List[Dict[str, Any]]:
-    """Process markdown files and create chunks"""
-    if not os.path.exists(folder_path):
-        logger.error(f"Markdown folder not found: {folder_path}")
-        return []
-    
-    md_documents = []
-    md_files = glob.glob(os.path.join(folder_path, "*.md"))
-    
-    if not md_files:
-        logger.warning(f"No markdown files found in {folder_path}")
-        return []
-    
-    for file_path in tqdm(md_files, desc="Processing markdown files"):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if not content.strip():
-                logger.warning(f"Empty file skipped: {file_path}")
-                continue
-            
-            filename = os.path.basename(file_path)
-            
-            # Extract title
-            title = filename.replace('.md', '').replace('_', ' ').title()
-            if content.startswith('#'):
-                first_line = content.split('\n')[0]
-                if first_line.startswith('#'):
-                    title = first_line.strip('#').strip()
-            
-            chunks = chunk_text(content)
-            
-            for i, chunk in enumerate(chunks):
-                md_documents.append({
-                    'filename': filename,
-                    'title': title,
-                    'chunk_id': i,
-                    'content': chunk,
-                    'full_content': content[:500] + "..." if len(content) > 500 else content
-                })
-                
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-    
-    logger.info(f"Processed {len(md_documents)} markdown chunks from {len(md_files)} files")
-    return md_documents
-
-def process_posts(filename: str) -> Dict[int, Dict[str, Any]]:
-    """Load and group posts by topic"""
-    if not os.path.exists(filename):
-        logger.error(f"Discourse file not found: {filename}")
-        return {}
-    
+def initialize_pinecone():
+    """Initialize Pinecone connection to existing index"""
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            posts_data = json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in discourse file: {e}")
-        return {}
-    except Exception as e:
-        logger.error(f"Error reading discourse file: {e}")
-        return {}
-    
-    if not isinstance(posts_data, list):
-        logger.error("Discourse data should be a list of posts")
-        return {}
-    
-    topics = {}
-    for post in posts_data:
-        if not isinstance(post, dict):
-            continue
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key:
+            raise ValueError("PINECONE_API_KEY environment variable is required")
         
-        topic_id = post.get("topic_id")
-        if topic_id is None:
-            continue
-            
-        if topic_id not in topics:
-            topics[topic_id] = {
-                "topic_title": post.get("topic_title", ""),
-                "posts": []
-            }
-        topics[topic_id]["posts"].append(post)
-    
-    # Sort posts by post number
-    for topic in topics.values():
-        topic["posts"].sort(key=lambda p: p.get("post_number", 0))
-    
-    logger.info(f"Processed {len(topics)} discourse topics")
-    return topics
-
-def initialize_system():
-    """Initialize the RAG system by loading and indexing data"""
-    try:
-        # Validate required environment variables
-        required_env_vars = {
-            "PINECONE_API_KEY": os.getenv("PINECONE_API_KEY"),
-            "HF_TOKEN": os.getenv("HF_TOKEN"),
-            "DISCOURSE_FILE_PATH": os.getenv("DISCOURSE_FILE_PATH"),
-            "MARKDOWN_FOLDER_PATH": os.getenv("MARKDOWN_FOLDER_PATH")
-        }
+        pinecone_client = Pinecone(api_key=pinecone_api_key)
+        index_name = "tds-embeddings-hf-v2"
         
-        missing_vars = [var for var, value in required_env_vars.items() if not value]
-        if missing_vars:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        # Check if index exists
+        if index_name not in pinecone_client.list_indexes().names():
+            raise ValueError(f"Index '{index_name}' not found. Please ensure embeddings are already created.")
         
-        # Test Hugging Face connection
-        try:
-            test_response = hf_llm.generate_completion([
-                {"role": "user", "content": "Hello, respond with just 'OK' if you're working."}
-            ], max_tokens=10)
-            logger.info(f"Hugging Face LLM test successful: {test_response}")
-        except Exception as e:
-            logger.error(f"Hugging Face LLM connection failed: {e}")
-            raise Exception("Make sure your HF_TOKEN is valid and has access to the required models")
+        index = pinecone_client.Index(index_name)
+        logger.info(f"Connected to existing Pinecone index: {index_name}")
         
-        # Load and process data
-        discourse_file = required_env_vars["DISCOURSE_FILE_PATH"]
-        markdown_folder = required_env_vars["MARKDOWN_FOLDER_PATH"]
-        
-        logger.info("Loading discourse data...")
-        topics = process_posts(discourse_file)
-        if not topics:
-            logger.warning("No discourse topics loaded")
-        
-        logger.info("Loading markdown files...")
-        md_documents = process_markdown_files(markdown_folder)
-        if not md_documents:
-            logger.warning("No markdown documents loaded")
-        
-        # Index data
-        if topics:
-            logger.info("Indexing discourse data...")
-            embed_and_index_discourse(topics)
-            logger.info("Discourse indexing complete")
-        
-        if md_documents:
-            logger.info("Indexing markdown data...")
-            embed_and_index_markdown(md_documents)
-            logger.info("Markdown indexing complete")
-        
-        logger.info("System initialization complete!")
+        return index
         
     except Exception as e:
-        logger.error(f"Error during system initialization: {e}")
+        logger.error(f"Failed to initialize Pinecone: {e}")
         raise
 
-def build_thread_map(posts: List[Dict[str, Any]]) -> Dict[Optional[int], List[Dict[str, Any]]]:
-    """Build reply tree structure"""
-    thread_map = {}
-    for post in posts:
-        parent = post.get("reply_to_post_number")
-        if parent not in thread_map:
-            thread_map[parent] = []
-        thread_map[parent].append(post)
-    return thread_map
-
-def extract_thread(root_num: int, posts: List[Dict[str, Any]], thread_map: Dict[Optional[int], List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """Extract full thread starting from root post"""
-    thread = []
-    
-    def collect_replies(post_num):
-        post = next((p for p in posts if p.get("post_number") == post_num), None)
-        if post:
-            thread.append(post)
-            for reply in thread_map.get(post_num, []):
-                collect_replies(reply.get("post_number"))
-    
-    collect_replies(root_num)
-    return thread
-
-def embed_and_index_discourse(topics: Dict[int, Dict[str, Any]], batch_size: int = 100):
-    """Embed discourse threads and index in Pinecone"""
-    vectors = []
-    
-    for topic_id, topic_data in tqdm(topics.items(), desc="Processing discourse topics"):
-        try:
-            posts = topic_data["posts"]
-            topic_title = topic_data["topic_title"]
-            
-            if not posts:
-                continue
-                
-            thread_map = build_thread_map(posts)
-            root_posts = thread_map.get(None, [])
-            
-            for root_post in root_posts:
-                root_post_num = root_post.get("post_number")
-                if root_post_num is None:
-                    continue
-                
-                thread = extract_thread(root_post_num, posts, thread_map)
-                
-                if not thread:
-                    continue
-                
-                # Build combined text
-                combined_text = f"Topic: {topic_title}\n\n"
-                thread_contents = []
-                for post in thread:
-                    content = post.get("content", "").strip()
-                    if content:
-                        thread_contents.append(content)
-                
-                if not thread_contents:
-                    continue
-                
-                combined_text += "\n\n---\n\n".join(thread_contents)
-                
-                try:
-                    embedding = hf_llm.get_embedding(combined_text)
-                except Exception as e:
-                    logger.error(f"Failed to get embedding for topic {topic_id}: {e}")
-                    continue
-                
-                vector = {
-                    "id": f"discourse_{topic_id}_{root_post_num}",
-                    "values": embedding,
-                    "metadata": {
-                        "source_type": "discourse",
-                        "topic_id": int(topic_id),
-                        "topic_title": topic_title,
-                        "root_post_number": int(root_post_num),
-                        "post_numbers": [str(p.get("post_number", 0)) for p in thread],
-                        "combined_text": combined_text,
-                        "url": f"https://discourse.onlinedegree.iitm.ac.in/t/{topic_id}/{root_post_num}"
-                    }
-                }
-                vectors.append(vector)
-                
-                if len(vectors) >= batch_size:
-                    index.upsert(vectors=vectors)
-                    vectors = []
-                    
-        except Exception as e:
-            logger.error(f"Error processing topic {topic_id}: {e}")
-            continue
-    
-    if vectors:
-        index.upsert(vectors=vectors)
-
-def embed_and_index_markdown(md_documents: List[Dict[str, Any]], batch_size: int = 100):
-    """Embed markdown documents and index in Pinecone"""
-    vectors = []
-    
-    for doc in tqdm(md_documents, desc="Processing markdown documents"):
-        try:
-            embedding = hf_llm.get_embedding(doc['content'])
-        except Exception as e:
-            logger.error(f"Failed to get embedding for {doc['filename']} chunk {doc['chunk_id']}: {e}")
-            continue
-        
-        vector = {
-            "id": f"markdown_{doc['filename']}_{doc['chunk_id']}",
-            "values": embedding,
-            "metadata": {
-                "source_type": "markdown",
-                "filename": doc['filename'],
-                "title": doc['title'],
-                "chunk_id": doc['chunk_id'],
-                "content": doc['content'],
-                "preview": doc['full_content']
-            }
-        }
-        vectors.append(vector)
-        
-        if len(vectors) >= batch_size:
-            try:
-                index.upsert(vectors=vectors)
-                vectors = []
-            except Exception as e:
-                logger.error(f"Failed to upsert batch: {e}")
-                vectors = []
-    
-    if vectors:
-        try:
-            index.upsert(vectors=vectors)
-        except Exception as e:
-            logger.error(f"Failed to upsert final batch: {e}")
-
-# Initialize FastAPI app
-app = FastAPI(title="TDS Virtual TA", description="Virtual Teaching Assistant with RAG capabilities")
-
-# Pydantic models for request/response
-class QuestionRequest(BaseModel):
-    question: str
-    image: Optional[str] = None  # base64 encoded image
-
-class LinkResponse(BaseModel):
-    url: str
-    text: str
-
-class AnswerResponse(BaseModel):
-    answer: str
-    links: List[LinkResponse] = []
-
-def semantic_search(query: str, top_k: int = 10, source_filter: str = None) -> List[Dict[str, Any]]:
-    """Search for relevant content using embeddings - INCREASED top_k for better coverage"""
+def semantic_search(query: str, index, llm: HuggingFaceQueryLLM, top_k: int = 10, source_filter: str = None) -> List[Dict[str, Any]]:
+    """Search for relevant content using embeddings"""
     try:
-        query_embedding = hf_llm.get_embedding(query)
+        query_embedding = llm.get_embedding(query)
     except Exception as e:
         logger.error(f"Failed to get query embedding: {e}")
         return []
@@ -579,7 +248,6 @@ def extract_discourse_links(results: List[Dict[str, Any]]) -> List[Dict[str, str
             url = result["url"]
             if url not in seen_urls:
                 seen_urls.add(url)
-                # Create meaningful link text
                 topic_title = result.get("topic_title", "Discussion")
                 links.append({
                     "url": url,
@@ -588,15 +256,13 @@ def extract_discourse_links(results: List[Dict[str, Any]]) -> List[Dict[str, str
     
     return links
 
-def generate_answer_with_links(query: str, context_results: List[Dict[str, Any]], image_base64: Optional[str] = None) -> Dict[str, Any]:
-    """Generate answer using context and optionally process image - IMPROVED PROMPT"""
+def generate_answer_with_links(query: str, context_results: List[Dict[str, Any]], llm: HuggingFaceQueryLLM, image_base64: Optional[str] = None) -> Dict[str, Any]:
+    """Generate answer using context and optionally process image"""
     
-    # Extract links early
     links = extract_discourse_links(context_results)
     
     # Check if we have relevant context
     if not context_results or all(result["score"] < 0.5 for result in context_results):
-        # Low relevance - might not have the information
         future_exam_keywords = ["end-term", "end term", "exam", "2025", "sep 2025", "september 2025"]
         if any(keyword in query.lower() for keyword in future_exam_keywords):
             return {
@@ -604,7 +270,7 @@ def generate_answer_with_links(query: str, context_results: List[Dict[str, Any]]
                 "links": links
             }
     
-    # Separate and format context by source type
+    # Format context
     discourse_context = []
     markdown_context = []
     
@@ -626,24 +292,22 @@ def generate_answer_with_links(query: str, context_results: List[Dict[str, Any]]
             logger.error(f"Error processing result: {e}")
             continue
     
-    # Build context string with better formatting
     context_parts = []
     
     if discourse_context:
         context_parts.append("=== FORUM DISCUSSIONS ===")
-        for i, ctx in enumerate(discourse_context[:3]):  # Limit to top 3
+        for i, ctx in enumerate(discourse_context[:3]):
             context_parts.append(f"\nDiscussion {i+1}: {ctx['title']}")
             context_parts.append(f"Content: {ctx['content'][:1000]}{'...' if len(ctx['content']) > 1000 else ''}")
     
     if markdown_context:
         context_parts.append("\n=== COURSE MATERIALS ===")
-        for i, ctx in enumerate(markdown_context[:3]):  # Limit to top 3
+        for i, ctx in enumerate(markdown_context[:3]):
             context_parts.append(f"\nMaterial {i+1}: {ctx['title']}")
             context_parts.append(f"Content: {ctx['content'][:1000]}{'...' if len(ctx['content']) > 1000 else ''}")
     
     context = "\n".join(context_parts) if context_parts else "No relevant context found."
     
-    # IMPROVED SYSTEM PROMPT - More specific and directive
     system_prompt = """You are a Virtual Teaching Assistant for the TDS (Tools in Data Science) course at IIT Madras. 
 
 IMPORTANT GUIDELINES:
@@ -657,10 +321,8 @@ IMPORTANT GUIDELINES:
 
 Be concise but thorough. If you find contradictory information, mention both perspectives."""
 
-    # Prepare messages for completion
     try:
         if image_base64:
-            # Handle image + text query
             processed_image = process_image(image_base64)
             
             messages = [
@@ -671,15 +333,14 @@ Be concise but thorough. If you find contradictory information, mention both per
                 ]}
             ]
             
-            answer = hf_llm.generate_completion_with_image(messages, temperature=0.3, max_tokens=1200)
+            answer = llm.generate_completion_with_image(messages, temperature=0.3, max_tokens=1200)
         else:
-            # Handle text-only query
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Question: {query}\n\nContext from TDS course materials and forum:\n{context}\n\nPlease answer the question based on the provided context."}
             ]
             
-            answer = hf_llm.generate_completion(messages, temperature=0.3, max_tokens=1200)
+            answer = llm.generate_completion(messages, temperature=0.3, max_tokens=1200)
         
         return {
             "answer": answer,
@@ -693,6 +354,35 @@ Be concise but thorough. If you find contradictory information, mention both per
             "links": links
         }
 
+# Initialize components
+try:
+    hf_llm = HuggingFaceQueryLLM()
+    pinecone_index = initialize_pinecone()
+    logger.info("All components initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize components: {e}")
+    raise
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="TDS Virtual TA - Query API", 
+    description="Virtual Teaching Assistant for querying TDS course content",
+    version="1.0.0"
+)
+
+# Pydantic models
+class QuestionRequest(BaseModel):
+    question: str
+    image: Optional[str] = None
+
+class LinkResponse(BaseModel):
+    url: str
+    text: str
+
+class AnswerResponse(BaseModel):
+    answer: str
+    links: List[LinkResponse] = []
+
 @app.post("/api/", response_model=AnswerResponse)
 async def answer_question(request: QuestionRequest):
     """Main API endpoint to answer questions with optional image support"""
@@ -700,13 +390,14 @@ async def answer_question(request: QuestionRequest):
         if not request.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
         
-        # Perform semantic search with increased coverage
-        results = semantic_search(request.question, top_k=10)
+        # Perform semantic search
+        results = semantic_search(request.question, pinecone_index, hf_llm, top_k=10)
         
         # Generate answer with links
         response_data = generate_answer_with_links(
             request.question, 
             results, 
+            hf_llm,
             request.image
         )
         
@@ -730,11 +421,19 @@ async def health_check():
             {"role": "user", "content": "Test"}
         ], max_tokens=5)
         
+        # Test Pinecone connection
+        index_stats = pinecone_index.describe_index_stats()
+        
         return {
             "status": "healthy",
             "huggingface": "connected",
+            "pinecone": "connected",
             "embedding_model": hf_llm.embedding_model,
-            "generation_model": hf_llm.model
+            "generation_model": hf_llm.model,
+            "index_stats": {
+                "total_vectors": index_stats.total_vector_count,
+                "dimension": index_stats.dimension
+            }
         }
     except Exception as e:
         return {
@@ -746,8 +445,9 @@ async def health_check():
 async def root():
     """Root endpoint with basic info"""
     return {
-        "message": "TDS Virtual TA API", 
-        "version": "1.0",
+        "message": "TDS Virtual TA Query API", 
+        "version": "1.0.0",
+        "description": "Query-only API for TDS course content using pre-built embeddings",
         "endpoints": {
             "POST /api/": "Answer questions with optional image support",
             "GET /health": "Health check",
@@ -756,8 +456,5 @@ async def root():
     }
 
 if __name__ == "__main__":
-    # Initialize the system (uncomment when you want to rebuild the index)
-    # initialize_system()
-    
     # Run the FastAPI server
     uvicorn.run(app, host="0.0.0.0", port=8000)
